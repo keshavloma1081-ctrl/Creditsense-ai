@@ -34,7 +34,7 @@ import joblib
 # ─────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────
-BASE = Path('C:/Users/kk536/creditsense')
+BASE = Path(__file__).parent
 DATA_PATH   = BASE / 'data/credit_train.csv'
 MODEL_PATH  = BASE / 'models'
 REPORT_PATH = BASE / 'reports'

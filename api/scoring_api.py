@@ -7,7 +7,7 @@ import joblib
 from pathlib import Path
 
 # ── Load artifacts ──────────────────────────────────────────
-MODEL_PATH = Path('C:/Users/kk536/creditsense/models/creditsense_model.pkl')
+MODEL_PATH = Path(__file__).parent.parent / 'models' / 'creditsense_model.pkl'
 artifacts  = joblib.load(MODEL_PATH)
 
 model          = artifacts['model']
