@@ -1,4 +1,5 @@
 # CreditSense AI 🏦
+🌐 **Live API:** https://web-production-f17e8.up.railway.app/docs
 
 > Real-time credit risk scoring API for thin-file borrowers in emerging markets
 
