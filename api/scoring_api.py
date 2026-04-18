@@ -11,6 +11,7 @@ import pandas as pd
 import joblib
 import sqlite3
 import datetime
+import shap
 import os
 from pathlib import Path
 
@@ -30,6 +31,7 @@ FEATURE_COLS = artifacts['feature_cols']
 THRESHOLD    = artifacts['threshold']
 MODEL_NAME   = artifacts['model_name']
 AUC_SCORE    = artifacts['auc_score']
+ENG_COLS     = artifacts['engineered_cols']
 
 # ── Database setup ───────────────────────────────────────────
 DB_PATH = Path(__file__).parent.parent / 'data' / 'predictions.db'
@@ -38,18 +40,18 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS predictions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   TEXT,
-            api_key     TEXT,
-            age         INTEGER,
-            income      REAL,
-            debt_ratio  REAL,
-            util        REAL,
-            late_total  INTEGER,
-            default_prob REAL,
-            risk_score  INTEGER,
-            risk_band   TEXT,
-            decision    TEXT
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT,
+            api_key       TEXT,
+            age           INTEGER,
+            income        REAL,
+            debt_ratio    REAL,
+            util          REAL,
+            late_total    INTEGER,
+            default_prob  REAL,
+            risk_score    INTEGER,
+            risk_band     TEXT,
+            decision      TEXT
         )
     ''')
     conn.commit()
@@ -77,6 +79,43 @@ def log_prediction(api_key, req, prob, score, band, decision):
     conn.commit()
     conn.close()
 
+# ── SHAP Explainer ───────────────────────────────────────────
+FEATURE_LABELS = {
+    'RevolvingUtil'      : 'Revolving credit utilization',
+    'age'                : 'Age',
+    'Late30_59'          : 'Times 30-59 days late',
+    'DebtRatio'          : 'Debt ratio',
+    'MonthlyIncome'      : 'Monthly income',
+    'OpenCreditLines'    : 'Open credit lines',
+    'Late90'             : 'Times 90+ days late',
+    'RealEstateLoans'    : 'Real estate loans',
+    'Late60_89'          : 'Times 60-89 days late',
+    'Dependents'         : 'Number of dependents',
+    'TotalLatePayments'  : 'Total late payments',
+    'IncomePerDependent' : 'Income per dependent',
+    'DebtToIncome'       : 'Debt to income ratio',
+    'UtilizationXDebt'   : 'Utilization x debt interaction',
+    'AgeGroup'           : 'Age group',
+    'IsHighUtilization'  : 'High utilization flag',
+    'HasLatePayments'    : 'Has late payments flag',
+    'LogIncome'          : 'Log income',
+}
+
+# Build a background dataset for SHAP
+_bg = pd.DataFrame(
+    np.zeros((1, len(ENG_COLS))),
+    columns=ENG_COLS
+)
+if scaler:
+    _bg_scaled = scaler.transform(_bg)
+    explainer = shap.LinearExplainer(
+        model,
+        _bg_scaled,
+        feature_perturbation="interventional"
+    )
+else:
+    explainer = shap.TreeExplainer(model)
+
 # ── Rate limiter ─────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
 
@@ -95,7 +134,7 @@ def verify_api_key(api_key: str = Security(api_key_header)):
 app = FastAPI(
     title="CreditSense AI",
     description="Real-time credit risk scoring API for thin-file borrowers",
-    version="2.0.0"
+    version="3.0.0"
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -120,6 +159,7 @@ class ScoringResponse(BaseModel):
     decision: str
     model_version: str
     threshold_used: float
+    explanation: Optional[dict] = None
 
 class BatchRequest(BaseModel):
     applicants: List[ScoringRequest]
@@ -156,7 +196,8 @@ def build_features(req: ScoringRequest) -> pd.DataFrame:
     X['LogIncome']          = np.log1p(X['MonthlyIncome'])
     return X
 
-def score_one(req: ScoringRequest):
+# ── Core scoring function ────────────────────────────────────
+def score_one(req: ScoringRequest, explain: bool = False):
     X = build_features(req)
     X_input = scaler.transform(X) if scaler else X.values
     prob = float(model.predict_proba(X_input)[0][1])
@@ -164,17 +205,44 @@ def score_one(req: ScoringRequest):
     bands = [(750,'Excellent'),(700,'Good'),(650,'Fair'),(600,'Poor')]
     band = next((b for s,b in bands if risk_score >= s), 'Very Poor')
     decision = "APPROVE" if prob < THRESHOLD else "DECLINE"
-    return prob, risk_score, band, decision
+
+    explanation = None
+    if explain:
+        shap_vals = explainer.shap_values(X_input)
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[1][0]
+        else:
+            shap_vals = shap_vals[0]
+
+        shap_dict = dict(zip(ENG_COLS, shap_vals))
+        sorted_shap = sorted(shap_dict.items(), key=lambda x: abs(x[1]), reverse=True)
+
+        top_reasons = []
+        for feat, val in sorted_shap[:3]:
+            label = FEATURE_LABELS.get(feat, feat)
+            direction = "High" if val > 0 else "Low"
+            feat_val = float(X[feat].iloc[0]) if feat in X.columns else 0
+            top_reasons.append(f"{direction} {label}: {feat_val:.2f}")
+
+        explanation = {
+            "top_reasons": top_reasons,
+            "shap_values": {
+                FEATURE_LABELS.get(f, f): round(float(v), 4)
+                for f, v in sorted_shap[:5]
+            }
+        }
+
+    return prob, risk_score, band, decision, explanation
 
 # ── Endpoints ────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
-        "product"  : "CreditSense AI",
-        "version"  : "2.0.0",
-        "model"    : MODEL_NAME,
-        "auc"      : round(AUC_SCORE, 4),
-        "status"   : "healthy"
+        "product" : "CreditSense AI",
+        "version" : "3.0.0",
+        "model"   : MODEL_NAME,
+        "auc"     : round(AUC_SCORE, 4),
+        "status"  : "healthy"
     }
 
 @app.get("/health")
@@ -186,10 +254,11 @@ def health():
 def score_applicant(
     request: Request,
     req: ScoringRequest,
+    explain: bool = False,
     api_key: str = Depends(verify_api_key)
 ):
     try:
-        prob, risk_score, band, decision = score_one(req)
+        prob, risk_score, band, decision, explanation = score_one(req, explain)
         log_prediction(api_key, req, prob, risk_score, band, decision)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -199,8 +268,9 @@ def score_applicant(
         risk_score          = risk_score,
         risk_band           = band,
         decision            = decision,
-        model_version       = f"{MODEL_NAME} v2.0",
-        threshold_used      = THRESHOLD
+        model_version       = f"{MODEL_NAME} v3.0",
+        threshold_used      = THRESHOLD,
+        explanation         = explanation
     )
 
 @app.post("/batch-score", response_model=BatchResponse)
@@ -216,15 +286,16 @@ def batch_score(
     results = []
     for req in batch.applicants:
         try:
-            prob, risk_score, band, decision = score_one(req)
+            prob, risk_score, band, decision, explanation = score_one(req)
             log_prediction(api_key, req, prob, risk_score, band, decision)
             results.append(ScoringResponse(
                 default_probability = round(prob, 4),
                 risk_score          = risk_score,
                 risk_band           = band,
                 decision            = decision,
-                model_version       = f"{MODEL_NAME} v2.0",
-                threshold_used      = THRESHOLD
+                model_version       = f"{MODEL_NAME} v3.0",
+                threshold_used      = THRESHOLD,
+                explanation         = explanation
             ))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -253,9 +324,9 @@ def stats(api_key: str = Depends(verify_api_key)):
     row = cursor.fetchone()
     conn.close()
     return {
-        "total_scored"    : row[0],
-        "approved"        : row[1],
-        "declined"        : row[2],
-        "avg_default_prob": row[3],
-        "avg_risk_score"  : row[4]
+        "total_scored"     : row[0],
+        "approved"         : row[1],
+        "declined"         : row[2],
+        "avg_default_prob" : row[3],
+        "avg_risk_score"   : row[4]
     }
