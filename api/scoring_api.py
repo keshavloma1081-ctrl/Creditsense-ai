@@ -24,9 +24,14 @@ API_KEYS   = os.getenv("API_KEYS", "").split(",")
 MODEL_PATH = Path(__file__).parent.parent / 'models' / 'creditsense_model.pkl'
 artifacts  = joblib.load(MODEL_PATH)
 
-model        = artifacts['model']
+# Load all models for ensemble
+lgb_model    = artifacts.get('lgb_model')
+xgb_model    = artifacts.get('xgb_model')
+lr_model     = artifacts.get('lr_model')
+model        = artifacts['model']  # Fallback
 imputer      = artifacts['imputer']
 scaler       = artifacts['scaler']
+USE_ENSEMBLE = artifacts.get('use_ensemble', False)
 FEATURE_COLS = artifacts['feature_cols']
 THRESHOLD    = artifacts['threshold']
 MODEL_NAME   = artifacts['model_name']
@@ -134,7 +139,7 @@ def verify_api_key(api_key: str = Security(api_key_header)):
 app = FastAPI(
     title="CreditSense AI",
     description="Real-time credit risk scoring API for thin-file borrowers",
-    version="3.0.0"
+    version="4.0.0"
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -200,7 +205,17 @@ def build_features(req: ScoringRequest) -> pd.DataFrame:
 def score_one(req: ScoringRequest, explain: bool = False):
     X = build_features(req)
     X_input = scaler.transform(X) if scaler else X.values
-    prob = float(model.predict_proba(X_input)[0][1])
+    
+    # Ensemble prediction
+    if USE_ENSEMBLE and lgb_model and xgb_model:
+        lgb_prob = float(lgb_model.predict_proba(X.values)[0][1])
+        xgb_prob = float(xgb_model.predict_proba(X.values)[0][1])
+        prob = (lgb_prob + xgb_prob) / 2  # Average ensemble
+        predict_model = lgb_model  # Use for SHAP
+    else:
+        prob = float(model.predict_proba(X_input)[0][1])
+        predict_model = model
+    
     risk_score = int(850 - prob * 550)
     bands = [(750,'Excellent'),(700,'Good'),(650,'Fair'),(600,'Poor')]
     band = next((b for s,b in bands if risk_score >= s), 'Very Poor')

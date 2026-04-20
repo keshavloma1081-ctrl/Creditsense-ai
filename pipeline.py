@@ -295,7 +295,11 @@ print("    Evaluation plot saved → reports/evaluation.png")
 print("\n[6] SAVING MODEL...")
 
 artifacts = {
-    'model'          : best_model,
+    'lgb_model'      : results['LightGBM']['model'],
+    'xgb_model'      : results['XGBoost']['model'],
+    'lr_model'       : results['Logistic Regression']['model'],
+    'best_model_name': best_name,
+    'model'          : best_model,  # Keep for backward compatibility
     'imputer'        : imputer,
     'scaler'         : scaler if best_name == 'Logistic Regression' else None,
     'feature_cols'   : FEATURE_COLS,
@@ -304,6 +308,7 @@ artifacts = {
     'model_name'     : best_name,
     'auc_score'      : float(results[best_name]['auc']),
     'training_rows'  : len(df),
+    'use_ensemble'   : True,
 }
 
 joblib.dump(artifacts, MODEL_PATH / 'creditsense_model.pkl')
